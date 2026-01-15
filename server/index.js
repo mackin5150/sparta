@@ -103,6 +103,10 @@ app.get('/', (req, res) => {
   res.status(200).send('OK');
 });
 
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 });
