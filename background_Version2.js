@@ -1,5 +1,5 @@
 // Background service worker: sends page excerpt to your server to index, and handles messages from popup.
-const SERVER_BASE = 'https://YOUR_SERVER_URL_OR_LOCALHOST:3000'; // replace with your server URL
+const SERVER_BASE = 'https://sparta-97q0.onrender.com:3000'; // replace with your server URL
 
 async function postJSON(path, body) {
   const res = await fetch(`${SERVER_BASE}${path}`, {
