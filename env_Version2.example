@@ -1,0 +1,4 @@
+# Server env vars
+OPENAI_API_KEY=sk-REPLACE_WITH_YOURS
+PORT=3000
+# If you deploy, set SERVER_BASE in the extension to your server URL (https://yourdomain.com)
