@@ -64,15 +64,20 @@ app.post('/index', async (req, res) => {
 
     const embedding = await embedText(text);
     const store = loadStore();
+    const existingIndex = store.docs.findIndex(d => d.url === url);
     const doc = {
-      id: uuidv4(),
+      id: existingIndex !== -1 ? store.docs[existingIndex].id : uuidv4(),
       title: title || '',
       url,
       excerpt: text.slice(0, 5000),
       embedding,
       created_at: new Date().toISOString()
     };
-    store.docs.push(doc);
+    if (existingIndex !== -1) {
+      store.docs[existingIndex] = doc; // replace existing
+    } else {
+      store.docs.push(doc);
+    }
     saveStore(store);
     return res.json({ ok: true, id: doc.id });
   } catch (err) {
