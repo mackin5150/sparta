@@ -1,243 +1,232 @@
-// MV2 background.js — whitelist stored in chrome.storage.local + auto-index handlers
-var SERVER_BASE = 'https://sparta-97q0.onrender.com'; // update if needed
-var EMBED_RATE_LIMIT_MS = 1000 * 60 * 30; // 30 minutes between automatic indexing per URL
-
-// Default whitelist used if none is stored
-var DEFAULT_WHITELIST = [
-  'dailymotion.com',
-  'flickr.com',
-  'vimeo.com',
-  'peertube'
-];
-
-function postJSON(path, body, cb) {
-  fetch(SERVER_BASE + path, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
-  })
-    .then(function(res) { return res.json(); })
-    .then(function(j) { cb(null, j); })
-    .catch(function(err) { cb(err && err.toString()); });
-}
-
-function getWhitelist(cb) {
-  chrome.storage.local.get({ whitelist: DEFAULT_WHITELIST }, function(items) {
-    cb(items.whitelist || DEFAULT_WHITELIST);
-  });
-}
-
-function addToWhitelist(domain, cb) {
-  if (!domain) return cb && cb(null);
-  getWhitelist(function(list) {
-    // avoid duplicates (substring check)
-    if (!list.some(d => d === domain)) list.push(domain);
-    chrome.storage.local.set({ whitelist: list }, function() {
-      cb && cb(list);
-    });
-  });
-}
-
-function removeFromWhitelist(domain, cb) {
-  getWhitelist(function(list) {
-    var idx = list.indexOf(domain);
-    if (idx !== -1) list.splice(idx, 1);
-    chrome.storage.local.set({ whitelist: list }, function() {
-      cb && cb(list);
-    });
-  });
-}
-
-function shouldAutoIndex(hostname, url, callback) {
-  if (!hostname) return callback(false, 'no_hostname');
-  getWhitelist(function(list) {
-    var allowed = list.some(function(d) { return hostname.indexOf(d) !== -1; });
-    if (!allowed) return callback(false, 'not_whitelisted');
-    chrome.storage.local.get(['lastIndexed'], function(items) {
-      var lastIndexed = items.lastIndexed || {};
-      var ts = lastIndexed[url] || 0;
-      var now = Date.now();
-      if (now - ts < EMBED_RATE_LIMIT_MS) {
-        return callback(false, 'rate_limited');
-      }
-      return callback(true, null);
-    });
-  });
-}
-
-function markIndexed(url) {
-  chrome.storage.local.get(['lastIndexed'], function(items) {
-    var lastIndexed = items.lastIndexed || {};
-    lastIndexed[url] = Date.now();
-    chrome.storage.local.set({ lastIndexed: lastIndexed });
-  });
-}
-
-// Helper: index the active tab (used for manual index action)
-function indexCurrentTab(addToWhitelistFlag, cb) {
-  chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-    var tab = tabs && tabs[0];
-    if (!tab) {
-      if (cb) cb({ ok: false, error: 'no_active_tab' });
-      return;
+// content-script.js — generic media extractor, suggestions overlay, and extract_page responder
+(function(){
+  // Lightweight site config: add more sites/selectors as needed
+  var SITE_CONFIG = [
+    {
+      hostContains: 'dailymotion.com',
+      itemSelector: '.media-block, .media, .video_item, .media__content',
+      titleSelector: 'h3, h2, .media-title, .title',
+      linkSelector: 'a[href*="/video/"], a[href*="/video/"]'
+    },
+    {
+      hostContains: 'flickr.com',
+      itemSelector: '.photo-list-photo-view, .view, .photo-list-photo',
+      imgSelector: 'img',
+      linkSelector: 'a[href*="/photos/"]',
+      titleSelector: 'img[alt]'
+    },
+    {
+      hostContains: 'vimeo.com',
+      itemSelector: '.iris_poster, .clip, .video, .iris_video-vital__poster',
+      linkSelector: 'a[href*="/videos/"], a[href*="/video/"]',
+      titleSelector: '.title, h3, h2'
+    },
+    {
+      hostContains: 'peertube',
+      itemSelector: '.card, .video-card, .video-thumb, .media-card',
+      linkSelector: 'a[href*="/w/"], a[href*="/videos/"], a[href*="/watch/"]',
+      titleSelector: '.title, h3, h2'
     }
-    // Ask content script to extract page content
-    chrome.tabs.sendMessage(tab.id, { type: 'extract_page' }, function(page) {
-      if (chrome.runtime.lastError) {
-        if (cb) cb({ ok: false, error: chrome.runtime.lastError.message });
-        return;
-      }
-      if (!page || !page.excerpt) {
-        if (cb) cb({ ok: false, error: 'no_content_extracted' });
-        return;
-      }
+    // Add more site configs here as needed
+  ];
 
-      // Optionally add the hostname to the whitelist
-      var hostname = '';
-      try { hostname = (new URL(page.url)).hostname; } catch (e) { hostname = ''; }
-      if (addToWhitelistFlag && hostname) {
-        addToWhitelist(hostname, function() {
-          // continue regardless of result
-        });
-      }
-
-      // Prepare payload (trim to reasonable sizes)
-      var payload = {
-        title: (page.title || '').slice(0, 300),
-        url: page.url,
-        text: (page.excerpt || '').slice(0, 2000)
-      };
-
-      postJSON('/index', payload, function(err, res) {
-        if (err) {
-          if (cb) cb({ ok: false, error: String(err) });
-          return;
-        }
-        // mark URL as indexed to honor rate limit
-        markIndexed(page.url);
-        if (cb) cb(res);
-      });
-    });
-  });
-}
-
-// Message handlers: maybe_index, multi_index, page_context_search, whitelist management, index_page
-chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
-  if (!msg || !msg.type) return;
-
-  if (msg.type === 'maybe_index') {
-    var doc = msg.doc || {};
-    var url;
-    try { url = (new URL(doc.url)).href; } catch (e) { url = doc.url; }
-    var hostname = (function() {
-      try { return (new URL(doc.url)).hostname; } catch (e) { return (doc.site || ''); }
-    })();
-
-    shouldAutoIndex(hostname, url, function(allow, reason) {
-      if (!allow) {
-        sendResponse({ ok: false, reason: reason });
-        return;
-      }
-      var payload = {
-        title: (doc.title || '').slice(0, 300),
-        url: url,
-        text: (doc.excerpt || '').slice(0, 1000)
-      };
-      postJSON('/index', payload, function(err, res) {
-        if (err) {
-          console.error('auto index error', err);
-          sendResponse({ ok: false, error: String(err) });
-          return;
-        }
-        markIndexed(url);
-        sendResponse(res);
-      });
-    });
-
-    return true;
+  function extractPageExcerpt() {
+    var nodes = Array.from(document.querySelectorAll('h1, h2, h3, p, li'))
+      .map(e => e.innerText)
+      .filter(Boolean);
+    var combined = nodes.slice(0, 80).join('\n\n');
+    return combined.slice(0, 600);
   }
 
-  if (msg.type === 'multi_index') {
-    var docs = msg.docs || [];
-    var pending = docs.length;
-    var results = [];
-    if (pending === 0) { sendResponse({ ok: true, results: [] }); return; }
-
-    docs.forEach(function(d) {
-      var url = d.url;
-      var hostname = '';
-      try { hostname = (new URL(url)).hostname; } catch (e) { hostname = ''; }
-      shouldAutoIndex(hostname, url, function(allow) {
-        if (!allow) {
-          results.push({ url: url, ok: false, reason: 'skipped' });
-          if (--pending === 0) sendResponse({ ok: true, results: results });
-          return;
-        }
-        postJSON('/index', { title: (d.title||'').slice(0,300), url: url, text: (d.excerpt||'').slice(0,800) }, function(err,res) {
-          if (!err && res && res.ok) markIndexed(url);
-          results.push({ url: url, ok: !err && res && res.ok, resp: res, error: err });
-          if (--pending === 0) sendResponse({ ok: true, results: results });
-        });
-      });
-    });
-
-    return true;
+  function resolveUrl(href) {
+    try { return (new URL(href, location.href)).href; } catch (e) { return href; }
   }
 
-  if (msg.type === 'page_context_search') {
-    var q = msg.query || '';
-    postJSON('/search', { query: q, top_k: msg.top_k || 6 }, function(err, res) {
-      if (err) return sendResponse({ error: String(err) });
-      sendResponse(res);
+  function genericCardFinder() {
+    var anchors = Array.from(document.querySelectorAll('a[href]'));
+    var candidates = anchors.filter(function(a) {
+      var h = a.getAttribute('href') || '';
+      if (!h) return false;
+      var L = h.toLowerCase();
+      return L.indexOf('/watch') !== -1 || L.indexOf('/video') !== -1 || L.indexOf('/videos') !== -1 ||
+             L.indexOf('/photos') !== -1 || L.match(/\.(jpg|jpeg|png|gif)$/);
+    }).map(function(a) {
+      var title = (a.textContent || a.getAttribute('title') || '').trim();
+      if (!title) {
+        var img = a.querySelector('img');
+        if (img) title = img.getAttribute('alt') || img.getAttribute('title') || '';
+      }
+      return { title: title || '', url: resolveUrl(a.href || a.getAttribute('href')), excerpt: (title || '').slice(0,200) };
     });
-    return true;
-  }
-
-  // manual index action from popup: add to whitelist and index current tab
-  if (msg.type === 'index_page') {
-    var addToWhitelistFlag = true; // automatic behavior requested
-    indexCurrentTab(addToWhitelistFlag, function(resp) {
-      sendResponse(resp);
-    });
-    return true;
-  }
-
-  // Whitelist control messages
-  if (msg.type === 'add_whitelist') {
-    var domain = msg.domain;
-    if (!domain) {
-      // if no domain passed, try to get active tab hostname
-      chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-        var host = '';
-        try { host = new URL((tabs[0] && tabs[0].url) || '').hostname; } catch(e) { host = ''; }
-        if (!host) return sendResponse({ ok: false, error: 'no_domain_found' });
-        addToWhitelist(host, function(list) { sendResponse({ ok: true, whitelist: list }); });
-      });
+    var seen = {};
+    return candidates.filter(function(c) {
+      if (!c.url) return false;
+      if (seen[c.url]) return false;
+      seen[c.url] = true;
       return true;
+    });
+  }
+
+  function extractMediaCards() {
+    var host = location.hostname || '';
+    var cfg = SITE_CONFIG.find(function(c) { return host.indexOf(c.hostContains) !== -1; });
+    var cards = [];
+    if (cfg) {
+      var items = [];
+      try {
+        if (cfg.itemSelector) items = Array.from(document.querySelectorAll(cfg.itemSelector));
+      } catch (e) { items = []; }
+      if (items.length === 0) items = Array.from(document.querySelectorAll('a[href]')).slice(0, 200);
+      items.forEach(function(node) {
+        try {
+          var link = null;
+          if (cfg.linkSelector) link = node.querySelector(cfg.linkSelector) || node.querySelector('a[href]');
+          if (!link && node.tagName && node.tagName.toLowerCase() === 'a') link = node;
+          if (!link) return;
+          var href = link.href || link.getAttribute('href');
+          if (!href) return;
+          var title = '';
+          if (cfg.titleSelector) {
+            var tnode = node.querySelector(cfg.titleSelector) || link;
+            title = tnode ? (tnode.innerText || tnode.getAttribute('title') || '') : '';
+          } else {
+            title = (link.innerText || link.getAttribute('title') || '').trim();
+          }
+          if (!title) {
+            var img = node.querySelector('img') || link.querySelector('img');
+            if (img) title = img.getAttribute('alt') || img.getAttribute('title') || '';
+          }
+          cards.push({ title: (title||'').trim(), url: resolveUrl(href), excerpt: (title||'').slice(0,200) });
+        } catch (e) { /* ignore item */ }
+      });
     } else {
-      addToWhitelist(domain, function(list) { sendResponse({ ok: true, whitelist: list }); });
-      return true;
+      cards = genericCardFinder();
     }
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < cards.length && out.length < 50; i++) {
+      var c = cards[i];
+      if (!c || !c.url) continue;
+      if (seen[c.url]) continue;
+      seen[c.url] = true;
+      out.push(c);
+    }
+    return out;
   }
 
-  if (msg.type === 'remove_whitelist') {
-    var domainR = msg.domain;
-    if (!domainR) {
-      chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-        var host = '';
-        try { host = new URL((tabs[0] && tabs[0].url) || '').hostname; } catch(e) { host = ''; }
-        if (!host) return sendResponse({ ok: false, error: 'no_domain_found' });
-        removeFromWhitelist(host, function(list) { sendResponse({ ok: true, whitelist: list }); });
+  function maybeSendPageIndex() {
+    var doc = {
+      title: document.title || '',
+      url: location.href,
+      excerpt: extractPageExcerpt(),
+      site: location.hostname
+    };
+    chrome.runtime.sendMessage({ type: 'maybe_index', doc: doc }, function(res) {
+      if (res && res.ok) console.log('Auto-index saved', res);
+    });
+  }
+
+  function sendMediaBatch() {
+    var cards = extractMediaCards();
+    if (!cards || cards.length === 0) return;
+    chrome.runtime.sendMessage({ type: 'multi_index', docs: cards.slice(0, 20) }, function(res) {
+      if (res) console.log('multi_index result', res);
+    });
+  }
+
+  // respond to background when it asks for an extract for manual indexing
+  chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+    if (msg && msg.type === 'extract_page') {
+      try {
+        var page = {
+          title: document.title || '',
+          url: location.href,
+          excerpt: extractPageExcerpt()
+        };
+        sendResponse(page);
+      } catch (e) {
+        sendResponse(null);
+      }
+      return true; // keep sendResponse alive (not strictly necessary here)
+    }
+  });
+
+  // Suggestions overlay (same as earlier)
+  var suggestionsPanel = null;
+  function showSuggestions(results) {
+    try {
+      if (!suggestionsPanel) {
+        suggestionsPanel = document.createElement('div');
+        suggestionsPanel.id = 'personal-search-suggestions';
+        var css = `
+#personal-search-suggestions { position: fixed; right: 12px; top: 80px; width: 320px; max-height: 420px; overflow:auto; background: rgba(255,255,255,0.98); border:1px solid rgba(0,0,0,0.08); box-shadow:0 6px 18px rgba(0,0,0,0.12); z-index:2147483647; padding:8px; font-family: Arial, sans-serif; font-size:13px; color:#111; border-radius:8px; }
+#personal-search-suggestions h4 { margin: 4px 0 8px; font-size:14px; }
+.ps-item { padding:6px; border-bottom:1px solid #eee; }
+.ps-item a { color:#065fd4; text-decoration:none; font-weight:600; }
+.ps-item .url { font-size:12px; color:#666; margin-top:4px; display:block; }
+.ps-close { position:absolute; right:6px; top:6px; cursor:pointer; color:#666; }
+`;
+        var style = document.createElement('style');
+        style.textContent = css;
+        document.head.appendChild(style);
+        document.body.appendChild(suggestionsPanel);
+      }
+      suggestionsPanel.innerHTML = '<h4>Suggested from your index <span class="ps-close">✕</span></h4>';
+      var closeBtn = suggestionsPanel.querySelector('.ps-close');
+      if (closeBtn) closeBtn.addEventListener('click', function() { suggestionsPanel.style.display = 'none'; });
+
+      (results || []).forEach(function(r) {
+        var div = document.createElement('div');
+        div.className = 'ps-item';
+        var title = r.title ? escapeHtml(r.title) : (r.url || '');
+        var url = r.url || '#';
+        var excerpt = r.excerpt ? escapeHtml(r.excerpt).slice(0,200) : '';
+        try {
+          var host = (new URL(url)).hostname;
+        } catch (e) {
+          var host = '';
+        }
+        div.innerHTML = '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + title + '</a>' +
+                        '<span class="url">' + host + '</span>' +
+                        '<div class="excerpt">' + excerpt + '</div>';
+        suggestionsPanel.appendChild(div);
       });
-      return true;
-    } else {
-      removeFromWhitelist(domainR, function(list) { sendResponse({ ok: true, whitelist: list }); });
-      return true;
-    }
+    } catch (e) { console.error('showSuggestions error', e); }
   }
 
-  if (msg.type === 'get_whitelist') {
-    getWhitelist(function(list) { sendResponse({ ok: true, whitelist: list }); });
-    return true;
+  function escapeHtml(s) {
+    return (s || '').replace(/[&<>"']/g, function (m) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]);
+    });
   }
-});
+
+  // Initial actions on load
+  try { maybeSendPageIndex(); } catch (e) { console.error(e); }
+
+  // If media-heavy site send media batch initially and on mutations
+  var host = location.hostname || '';
+  var isMediaSite = SITE_CONFIG.some(function(c){ return host.indexOf(c.hostContains) !== -1; }) ||
+                    ['dailymotion.com','flickr.com','vimeo.com','peertube'].some(function(d){ return host.indexOf(d) !== -1; });
+
+  if (isMediaSite) {
+    sendMediaBatch();
+    var timer = null;
+    var mo = new MutationObserver(function() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function(){ sendMediaBatch(); }, 1500);
+    });
+    try { mo.observe(document.body, { childList: true, subtree: true }); } catch (e) { /* ignore */ }
+  }
+
+  // Request suggestions based on page title
+  try {
+    var query = document.title || '';
+    if (query && query.length > 2) {
+      chrome.runtime.sendMessage({ type: 'page_context_search', query: query, top_k: 6 }, function(res) {
+        if (!res || res.error) return;
+        if (res.results && res.results.length) showSuggestions(res.results);
+      });
+    }
+  } catch (e) { console.error(e); }
+
+})();

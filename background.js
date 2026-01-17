@@ -193,6 +193,15 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
     return true;
   }
 
+  if (msg.type === 'search') {
+    var q2 = msg.query || '';
+    postJSON('/search', { query: q2, top_k: msg.top_k || 10 }, function(err, res) {
+      if (err) return sendResponse({ error: String(err) });
+      sendResponse(res);
+    });
+    return true;
+  }
+
   // manual index action from popup: add to whitelist and index current tab
   if (msg.type === 'index_page') {
     var addToWhitelistFlag = true; // automatic behavior requested
